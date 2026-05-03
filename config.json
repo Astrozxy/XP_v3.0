@@ -1,0 +1,70 @@
+{
+    "data": {
+        "dataset_h5": "data/stellar_dataset.h5",
+        "latent_dim": 2
+    },
+    "model": {
+        "hidden_dim": 256,
+        "depth": 3,
+        "dtype": "float16"
+    },
+    "stages": [
+        {
+            "name": "Stage 1",
+            "epochs": 512,
+            "batch_size": 1024,
+            "lr": 0.0002,
+            "free_keys": [],
+            "update_model": true,
+            "train_k1": false,
+            "lambda_latent": 1.0,
+            "lambda_xi": 0.0,
+            "lambda_smooth": 0.001
+        },
+        {
+            "name": "Stage 2",
+            "epochs": 256,
+            "batch_size": 1024,
+            "lr": 0.0002,
+            "free_keys": ["latent"],
+            "update_model": false,
+            "train_k1": false,
+            "lambda_latent": 1.0,
+            "lambda_xi": 0.0,
+            "lambda_smooth": 0.001
+        },
+        {
+            "name": "Stage 3",
+            "epochs": 512,
+            "batch_size": 1024,
+            "lr": 0.0001,
+            "free_keys": ["latent"],
+            "update_model": true,
+            "train_k1": false,
+            "lambda_latent": 1.0,
+            "lambda_xi": 0.0,
+            "lambda_smooth": 0.001
+        },
+        {
+            "name": "Stage 4",
+            "epochs": 256,
+            "batch_size": 1024,
+            "lr": 0.0001,
+            "free_keys": ["x", "E", "plx", "latent"],
+            "update_model": true,
+            "train_k1": false,
+            "lambda_x": 1.0,
+            "lambda_E": 1.0,
+            "lambda_plx": 1.0,
+            "lambda_latent": 1.0,
+            "lambda_xi": 0.0,
+            "lambda_smooth": 0.001
+        }
+    ],
+    "training": {
+        "num_workers": 0,
+        "pin_memory": true,
+        "checkpoint_dir": "checkpoints",
+        "final_model_path": "stellar_model.pt"
+    }
+}

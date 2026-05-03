@@ -1,7 +1,11 @@
+from model import *
+
 from __future__ import annotations
 import os
+import json
+import glob
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List, Any
 
 import torch
 import torch.nn as nn
@@ -14,486 +18,179 @@ import numpy as np
 import h5py
 from astropy.table import Table
 
-def save_as_h5(d, name):
-    print(f'Saving as {name}')
-    with h5py.File(name, 'w') as f:
-        for key in d.keys():
-            f[key] = d[key]
-    return 0
+# ========== 你的原始模型代码（保持不变）==========
+# ... 这里放置你原来的所有类定义 ...
+# StellarDataset, build_P_66xL, StellarSpectrumModel,
+# ApplyExtinction, StellarModel, compute_loss, init_star_params, train_stage
+# ================================================
 
+def load_config(config_path="config.json"):
+    """加载配置文件"""
+    with open(config_path, 'r') as f:
+        config = json.load(f)
 
-def load_h5(name):
-    print(f'Loading {name}')
-    d = {}
-    with h5py.File(name, 'r') as f:
-        for key in f.keys():
-            d[key] = f[key][:]
-    return d     
+    # 转换 dtype
+    dtype_str = config["model"].get("dtype", "float16")
+    if dtype_str == "float16":
+        config["model"]["dtype"] = torch.float16
+    elif dtype_str == "float32":
+        config["model"]["dtype"] = torch.float32
+    else:
+        config["model"]["dtype"] = torch.float16
 
-dtype=torch.float16
+    return config
 
+def save_checkpoint(stage_num, model, star_params, config, optimizer_state=None):
+    """保存 checkpoint，包含所有训练状态"""
+    checkpoint_dir = config["training"]["checkpoint_dir"]
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
-# Build dataset
-class StellarDataset(Dataset):
-    def __init__(
-        self,
-        x: torch.Tensor,
-        E: torch.Tensor,
-        xi: torch.Tensor,
-        plx: torch.Tensor,
-        x_err: torch.Tensor,
-        E_err: torch.Tensor,
-        xi_err: torch.Tensor,
-        plx_err: torch.Tensor,
-        flux: torch.Tensor,
-        flux_sqrticov: torch.Tensor,
-        latent: Optional[torch.Tensor] = None,
-        latent_dim: int = 3,
-        dtype: torch.dtype = torch.float16,
-    ):
-        super().__init__()
+    checkpoint_path = os.path.join(checkpoint_dir, f"stage{stage_num}.pt")
 
-        self.x = x.to(dtype)
-        self.E = E.to(dtype).view(-1)
-        self.xi = xi.to(dtype).view(-1)
-        self.plx = plx.to(dtype).view(-1)
-
-        self.x_err = x_err.to(dtype)
-        self.E_err = E_err.to(dtype).view(-1)
-        self.xi_err = xi_err.to(dtype).view(-1)
-        self.plx_err = plx_err.to(dtype).view(-1)
-
-        self.flux = flux.to(dtype)
-        self.flux_sqrticov = flux_sqrticov.to(dtype)
-
-        n = self.x.shape[0]
-        self.latent = torch.zeros(n, latent_dim, dtype=dtype) if latent is None else latent.to(dtype)
-
-        assert self.E.numel() == n and self.xi.numel() == n and self.plx.numel() == n
-        assert self.latent.shape == (n, latent_dim)
-        assert self.flux.shape == (n, 66)
-        assert self.flux_sqrticov.shape == (n, 66, 66)
-
-    def __len__(self):
-        return self.x.shape[0]
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        return {
-            "idx": torch.tensor(idx, dtype=torch.long),
-            "x": self.x[idx],
-            "E": self.E[idx],
-            "xi": self.xi[idx],
-            "plx": self.plx[idx],
-            "x_err": self.x_err[idx],
-            "E_err": self.E_err[idx],
-            "xi_err": self.xi_err[idx],
-            "plx_err": self.plx_err[idx],
-            "latent": self.latent[idx],
-            "flux": self.flux[idx],
-            "flux_sqrticov": self.flux_sqrticov[idx],
-        }
-
-
-# -------------------------
-# 2) Fixed projection matrix P (build once)
-# -------------------------
-def build_P_66xL(
-    wave_hi_start=387.0,
-    wave_hi_end=997.0,
-    wave_hi_step=3.0,
-    wave_obs_start=392.0,
-    wave_obs_end=992.0,
-    wave_obs_step=10.0,
-    extra_bands=5,
-    dtype=torch.float16,
-    device="cpu",
-):
-    """
-    Build P (66, L), where first 61 rows interpolate a high-res optical grid to 61 observed optical points,
-    and last 5 rows pick the extra 5 bands directly.
-    """
-    wave_hi = torch.arange(wave_hi_start, wave_hi_end + 1e-6, wave_hi_step, dtype=dtype, device=device)   # (L_spec,)
-    wave_obs = torch.arange(wave_obs_start, wave_obs_end + 1e-6, wave_obs_step, dtype=dtype, device=device) # (61,)
-    
-    L_spec = wave_hi.numel()
-    L = L_spec + extra_bands
-
-    idx = torch.searchsorted(wave_hi, wave_obs)
-    idx = torch.clamp(idx, 1, L_spec - 1)
-
-    x0 = wave_hi[idx - 1]
-    x1 = wave_hi[idx]
-    t = (wave_obs - x0) / (x1 - x0)
-    w0 = 1 - t
-    w1 = t
-
-    P61 = torch.zeros(61, L_spec, dtype=dtype, device=device)
-    rows = torch.arange(61, device=device)
-    P61[rows, idx - 1] = w0
-    P61[rows, idx] = w1
-
-    P = torch.zeros(66, L, dtype=dtype, device=device)
-    P[:61, :L_spec] = P61
-
-    # last 5 dims are direct picks
-    for i in range(extra_bands):
-        P[61 + i, L_spec + i] = 1.0
-
-    return P, L_spec
-
-
-
-
-class StellarSpectrumModel(nn.Module):
-    def __init__(self, in_dim: int, L: int, hidden=256, depth=3, dtype=torch.float32):
-        super().__init__()
-        layers = []
-        d = in_dim
-        for _ in range(depth):
-            layers += [nn.Linear(d, hidden, dtype=dtype), nn.Tanh()]
-            d = hidden
-        layers.append(nn.Linear(d, L, dtype=dtype))
-
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        log_F = self.net(x)
-        #log_F = torch.clamp(log_F, -10.0, 10.0)  # 防止 exp 爆炸
-        return log_F
-    
-# -------------------------
-# 3) Modules with clean interfaces
-# -------------------------
-class ApplyExtinction(nn.Module):
-    """
-    A(λ) = E * tanh[ k0(λ) + xi * k1(λ) ]
-    F_obs = F_int * exp(-A)
-    """
-    def __init__(
-        self,
-        L: int,
-        init_k0: Optional[torch.Tensor] = None,
-        init_k1: Optional[torch.Tensor] = None,
-        dtype: torch.dtype = torch.float32,
-    ):
-        super().__init__()
-        if init_k0 is None:
-            wavelength_IRbands = np.array([1235, 1662, 2159, 3400, 4600])
-            init_k0 = torch.as_tensor(np.log(2 * (np.hstack([387.0 + np.arange(L-5) *3, wavelength_IRbands])/550.)**(-1.5)), dtype=dtype)
-        else:
-            init_k0 = torch.as_tensor(init_k0, dtype=dtype).view(-1)
-            assert init_k0.numel() == L
-
-        if init_k1 is None:
-            init_k1 = torch.as_tensor(np.arange(L) / L*0, dtype=dtype)
-        else:
-            init_k1 = torch.as_tensor(init_k1, dtype=dtype).view(-1)
-            assert init_k1.numel() == L
-
-        self.k0 = nn.Parameter(init_k0.clone())
-        self.k1 = nn.Parameter(init_k1.clone())
-
-    def forward(self, log_F_int: torch.Tensor, E: torch.Tensor, xi: torch.Tensor) -> torch.Tensor:
-        # F_int: (B,L), E: (B,), xi: (B,)
-        # extinction curves should always be positive. Use ln_Ext_curve 
-        # E can be still in this way
-        A = E[:, None] * torch.exp(self.k0[None, :] + torch.tanh(xi[:, None]) * self.k1[None, :])
-
-        return log_F_int  - A # Still in log space!
-
-
-# -------------------------
-# 4) Full model: forward(batch) only
-# -------------------------
-class StellarModel(nn.Module):
-    def __init__(
-        self,
-        P_66xL: torch.Tensor,
-        x_dim: int = 4,
-        latent_dim: int = 1,
-        init_k0: Optional[torch.Tensor] = None,
-        init_k1: Optional[torch.Tensor] = None,
-        dtype=torch.float32,
-    ):
-        super().__init__()
-
-        P_66xL = torch.as_tensor(P_66xL, dtype=dtype)
-        self.register_buffer("P", P_66xL)
-
-        L = P_66xL.shape[1]
-
-        self.spectrum_model = StellarSpectrumModel(
-            in_dim=x_dim + latent_dim,
-            L=L,
-            dtype=dtype,
-        )
-
-        self.extinction = ApplyExtinction(
-            L=L,
-            init_k0=init_k0,
-            init_k1=init_k1,
-            dtype=dtype,
-        )
-
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        x_pred = batch.get("x_pred", batch["x"])
-        E_pred = batch.get("E_pred", batch["E"]).view(-1)
-        xi_pred = batch.get("xi_pred", batch["xi"]).view(-1)
-        log_plx_pred = batch.get("log_plx_pred", torch.log(batch["plx"])).view(-1)
-        latent = batch.get("latent_pred", batch["latent"])
-
-        # Make 2 different matrices
-        # One take the stellar parameters, another one take the latent parameter,
-        # hidden_1 = W_1 @ theta + W_2 @ latent
-        # In addition to penalty on latent parameters, add one more on the weights in W_2.
-        # Ask AI for penalties on the similarities between latent parameters and stellar parameters.
-
-        log_F_int = self.spectrum_model(torch.cat([x_pred, latent], dim=-1)) 
-        # No need for clamp min parallax; Use log parallax instead
-        log_F_int = log_F_int  + 2*log_plx_pred[:, None] 
-
-        log_F_obs = self.extinction(log_F_int, E_pred, xi_pred)
-        flux_pred = torch.exp(log_F_obs) @ self.P.T # Convert back to the flux space
-
-        return {
-            "flux_pred": flux_pred,
-            "log_F_int": log_F_int,
-            "log_F_obs": log_F_obs,
-            "ext_k0": self.extinction.k0,
-            "ext_k1": self.extinction.k1,
-            "latent": latent,
-            "xi_pred": xi_pred,
-        }
-
-
-
-# -------------------------
-# 5) Loss
-# -------------------------
-def compute_loss(
-    batch: Dict[str, torch.Tensor],
-    out: Dict[str, torch.Tensor],
-    L_spec: int,
-    lambda_xi: float = 1.0,
-    lambda_latent: float = 1.0,
-    lambda_smooth: float = 1e-3,
-    ) -> torch.Tensor:
-    d_flux = (batch["flux"] - out["flux_pred"]).unsqueeze(-1)
-    Wr = batch["flux_sqrticov"] @ d_flux
-    chi2_flux = Wr.squeeze(-1).pow(2).sum(dim=1)
-
-    # use observed xi as prior
-    xi_err = batch["xi_err"].clamp_min(1e-6)
-    chi2_xi = ((out["xi_pred"] - batch["xi"]) / xi_err).pow(2)
-
-    chi2_latent = out["latent"].pow(2).sum(dim=1)
-
-    log_F = out["log_F_int"][:, :L_spec]
-    d2 = log_F[:, 2:] - 2 * log_F[:, 1:-1] + log_F[:, :-2]
-    smooth = d2.pow(2).mean(dim=1)
-
-    k0 = out["ext_k0"][:L_spec]
-    k1 = out["ext_k1"][:L_spec]
-    d2_k0 = k0[2:] - 2 * k0[1:-1] + k0[:-2]
-    d2_k1 = k1[2:] - 2 * k1[1:-1] + k1[:-2]
-    smooth_ext = d2_k0.pow(2).mean() + d2_k1.pow(2).mean()
-
-    loss = (
-        chi2_flux
-        + lambda_xi * chi2_xi
-        + lambda_latent * chi2_latent 
-        + lambda_smooth * (smooth + smooth_ext)
-    )
-
-    return loss.mean()
-
-
-
-def init_star_params(dataset: Dataset, device: str, latent_dim: int = 3):
-    x0 = dataset.x.to(device)
-    E0 = dataset.E.to(device)
-    xi0 = dataset.xi.to(device)
-    plx0 = dataset.plx.to(device).clamp_min(1e-6)
-    N = len(dataset)
-
-    star = {
-        "x_pred": nn.Parameter(x0.clone()),
-        "E_pred": nn.Parameter(E0.clone().view(-1)),
-        "xi_pred": nn.Parameter(xi0.clone().view(-1)),
-        "log_plx_pred": nn.Parameter(torch.log(plx0.view(-1))),
-        "latent_pred": nn.Parameter(torch.randn(N, latent_dim, device=device)), # Perhaps too small?
+    checkpoint = {
+        "stage": stage_num,
+        "model_state": model.state_dict(),
+        "star_params": {k: v.detach().cpu() for k, v in star_params.items()},
+        "config": config,  # 保存配置以便恢复时验证
     }
 
+    if optimizer_state is not None:
+        checkpoint["optimizer_state"] = optimizer_state
+
+    torch.save(checkpoint, checkpoint_path)
+    print(f"✓ Checkpoint saved to {checkpoint_path}")
+
+    # 同时保存一个 latest checkpoint
+    latest_path = os.path.join(checkpoint_dir, "latest.pt")
+    torch.save(checkpoint, latest_path)
+
+def load_latest_checkpoint(config, device, latent_dim, dataset):
+    """加载最新的 checkpoint，返回 (model, star, start_stage)"""
+    checkpoint_dir = config["training"]["checkpoint_dir"]
+
+    # 查找所有 stage checkpoint
+    stage_files = glob.glob(os.path.join(checkpoint_dir, "stage*.pt"))
+    stage_files = [f for f in stage_files if "stage" in f and not f.endswith("latest.pt")]
+
+    if not stage_files:
+        print("No checkpoint found, starting from scratch.")
+        return None, None, 0
+
+    # 提取 stage 编号
+    stage_nums = []
+    for f in stage_files:
+        try:
+            # 提取 stage 数字，例如 stage1.pt -> 1
+            stage_num = int(os.path.basename(f).replace("stage", "").replace(".pt", ""))
+            stage_nums.append((stage_num, f))
+        except:
+            continue
+
+    if not stage_nums:
+        return None, None, 0
+
+    # 找到最大的 stage 编号
+    stage_nums.sort(key=lambda x: x[0])
+    latest_stage, latest_file = stage_nums[-1]
+
+    print(f"Loading checkpoint from {latest_file} (Stage {latest_stage})")
+    checkpoint = torch.load(latest_file, map_location="cpu")
+
+    # 验证配置一致性（可选）
+    saved_config = checkpoint.get("config", {})
+    if saved_config and saved_config != config:
+        print("Warning: Saved config differs from current config. Using saved checkpoint values.")
+
+    # 重建模型
+    P, L_spec = build_P_66xL(dtype=config["model"]["dtype"], device="cpu")
+    model = StellarModel(
+        P_66xL=P,
+        latent_dim=latent_dim,
+        init_k1=torch.zeros(P.shape[1]),
+        dtype=config["model"]["dtype"],
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state"])
+
+    # 重建 star 参数
+    star_values = checkpoint["star_params"]
+    star = {
+        "x_pred": nn.Parameter(star_values["x_pred"].to(device)),
+        "E_pred": nn.Parameter(star_values["E_pred"].to(device).view(-1)),
+        "xi_pred": nn.Parameter(star_values["xi_pred"].to(device).view(-1)),
+        "log_plx_pred": nn.Parameter(star_values["log_plx_pred"].to(device).view(-1)),
+        "latent_pred": nn.Parameter(star_values["latent_pred"].to(device)),
+    }
+
+    return model, star, latest_stage
+
+def recreate_star_params(star_values, device, latent_dim):
+    """从保存的值重新创建 star 参数字典"""
+    star = {
+        "x_pred": nn.Parameter(star_values["x_pred"].to(device)),
+        "E_pred": nn.Parameter(star_values["E_pred"].to(device).view(-1)),
+        "xi_pred": nn.Parameter(star_values["xi_pred"].to(device).view(-1)),
+        "log_plx_pred": nn.Parameter(star_values["log_plx_pred"].to(device).view(-1)),
+        "latent_pred": nn.Parameter(star_values["latent_pred"].to(device)),
+    }
     return star
 
-
-
-def train_stage(
-    *,
-    model: nn.Module,
-    dataset,
-    L_spec: int,
-    device: str,
-    epochs: int,
-    batch_size: int = 128,
-    lr: float = 1e-4,
-    num_workers: int = 0,
-    pin_memory: bool = True,
-    free_keys: Tuple[str, ...] = (),
-    update_model: bool = True,
-    train_k1: bool = True,
-    star_params: Dict[str, nn.Parameter] | None = None,
-    lambda_x: float = 1.0,
-    lambda_E: float = 1.0,
-    lambda_plx: float = 1.0,
-    lambda_xi: float = 0.0, # -> Set this to 0 intially, as we are not updating xi.
-    lambda_latent: float = 1.0,
-    lambda_latent_grad: float = 1.0,
-    lambda_smooth: float = 1.0, # -> Used to be 0.01, which seems too small.
-    desc: str = "Stage",
+def train_stage_from_config(
+    model, dataset, star, stage_config, stage_num,
+    L_spec, device, config
 ):
-    free_keys = tuple(free_keys)
-    valid = {"x", "E", "xi", "plx", "latent"}
+    """根据配置训练单个阶段"""
 
-    if any(k not in valid for k in free_keys):
-        raise ValueError(f"free_keys must be subset of {valid}, got {free_keys}")
+    # 准备参数
+    kwargs = {
+        "model": model,
+        "dataset": dataset,
+        "L_spec": L_spec,
+        "device": device,
+        "epochs": stage_config["epochs"],
+        "batch_size": stage_config.get("batch_size", 1024),
+        "lr": stage_config["lr"],
+        "free_keys": tuple(stage_config.get("free_keys", [])),
+        "update_model": stage_config.get("update_model", True),
+        "train_k1": stage_config.get("train_k1", False),
+        "star_params": star,
+        "lambda_latent": stage_config.get("lambda_latent", 1.0),
+        "lambda_xi": stage_config.get("lambda_xi", 0.0),
+        "lambda_smooth": stage_config.get("lambda_smooth", 0.001),
+        "desc": f"{stage_config['name']} (Stage {stage_num})",
+    }
 
-    if star_params is None:
-        raise ValueError("star_params must be provided.")
+    # 添加可选参数
+    if "lambda_x" in stage_config:
+        kwargs["lambda_x"] = stage_config["lambda_x"]
+    if "lambda_E" in stage_config:
+        kwargs["lambda_E"] = stage_config["lambda_E"]
+    if "lambda_plx" in stage_config:
+        kwargs["lambda_plx"] = stage_config["lambda_plx"]
 
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=(num_workers > 0),
-    )
+    train_stage(**kwargs)
 
-    model.to(device)
+def main(config_path="config.json"):
+    """主训练函数"""
 
-    trainables = []
+    # 1. 加载配置
+    config = load_config(config_path)
+    print("Configuration loaded:")
+    print(json.dumps(config, indent=2, default=str))
 
-    if update_model:
-        for name, p in model.named_parameters():
-            if name == "extinction.k1" and not train_k1:
-                continue
-            trainables.append(p)
+    # 2. 设置设备和数据类型
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    if "x" in free_keys:
-        trainables.append(star_params["x_pred"])
-    if "E" in free_keys:
-        trainables.append(star_params["E_pred"])
-    if "xi" in free_keys:
-        trainables.append(star_params["xi_pred"])
-    if "plx" in free_keys:
-        trainables.append(star_params["log_plx_pred"])
-    if "latent" in free_keys:
-        trainables.append(star_params["latent_pred"])
+    dtype = config["model"]["dtype"]
+    latent_dim = config["data"]["latent_dim"]
 
-    if len(trainables) == 0:
-        raise ValueError("No trainables selected.")
-
-    optimizer = torch.optim.Adam(trainables, lr=lr)
-
-    x0 = dataset.x.to(device)
-    E0 = dataset.E.to(device).view(-1)
-    plx0 = dataset.plx.to(device).view(-1).clamp_min(1e-6)
-
-    pbar = tqdm(range(epochs), desc=desc, dynamic_ncols=True)
-
-    for _ in pbar:
-        model.train()
-        total = 0.0
-
-        for batch in loader:
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            idx = batch["idx"].view(-1)
-
-            batch_fwd = dict(batch)
-            batch_fwd["latent_pred"] = star_params["latent_pred"][idx]
-
-            if "x" in free_keys:
-                batch_fwd["x_pred"] = star_params["x_pred"][idx]
-
-            if "E" in free_keys:
-                batch_fwd["E_pred"] = star_params["E_pred"][idx].view(-1)
-
-            if "xi" in free_keys:
-                batch_fwd["xi_pred"] = star_params["xi_pred"][idx].view(-1)
-
-            if "plx" in free_keys:
-                batch_fwd["log_plx_pred"] = star_params["log_plx_pred"][idx].view(-1)
-
-            out = model(batch_fwd)
-
-            loss = compute_loss(
-                batch,
-                out,
-                L_spec,
-                lambda_xi=lambda_xi,
-                lambda_latent=lambda_latent,
-                lambda_smooth=lambda_smooth,
-            )
-
-            if update_model and lambda_latent_grad != 0:
-                grad_logF_latent = torch.autograd.grad(
-                    outputs=out["log_F_int"][:, :L_spec].sum(),
-                    inputs=out["latent"],
-                    create_graph=True,
-                    retain_graph=True,
-                )[0]
-
-                latent_grad_loss = grad_logF_latent.pow(2).sum(dim=1).mean()
-                loss = loss + lambda_latent_grad * latent_grad_loss
-
-            prior_loss = 0.0
-
-            if "x" in free_keys:
-                x_err = batch["x_err"].clamp_min(1e-6)
-                prior_loss = prior_loss + lambda_x * (
-                    (star_params["x_pred"][idx] - x0[idx]) / x_err
-                ).pow(2).sum(dim=1).mean()
-
-            if "E" in free_keys:
-                E_err = batch["E_err"].view(-1).clamp_min(1e-6)
-                prior_loss = prior_loss + lambda_E * (
-                    (star_params["E_pred"][idx].view(-1) - E0[idx]) / E_err
-                ).pow(2).mean()
-
-            if "plx" in free_keys:
-                log_plx_pred = star_params["log_plx_pred"][idx].view(-1)
-                plx_err = batch["plx_err"].view(-1).clamp_min(1e-6)
-                sig_log_plx = (plx_err / plx0[idx]).clamp_min(1e-6)
-
-                prior_loss = prior_loss + lambda_plx * (
-                    (log_plx_pred - torch.log(plx0[idx])) / sig_log_plx
-                ).pow(2).mean()
-
-            loss = loss + prior_loss
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-
-            total += loss.item()
-
-        pbar.set_postfix(loss=f"{total / len(loader):.3e}")
-
-
-
-# -------------------------
-# 7) Build P, create dataset/model, then train
-# -------------------------
-if __name__ == "__main__":
-    latent_dim = 2
-    dataset_h5 = "data/stellar_dataset.h5"
- 
+    # 3. 构建投影矩阵
     P, L_spec = build_P_66xL(dtype=dtype, device="cpu")
-    print("P shape:", tuple(P.shape), "L_spec:", L_spec)
+    print(f"P shape: {tuple(P.shape)}, L_spec: {L_spec}")
 
+    # 4. 加载数据集
+    dataset_h5 = config["data"]["dataset_h5"]
     print(f"Loading dataset from {dataset_h5}")
-    
 
     with h5py.File(dataset_h5, "r") as f:
         dataset = StellarDataset(
@@ -509,92 +206,75 @@ if __name__ == "__main__":
             flux_sqrticov=torch.from_numpy(f["flux_sqrticov"][:]),
             latent=torch.from_numpy(f["latent"][:]),
             latent_dim=latent_dim,
+            dtype=dtype,
+        )
+
+    # 5. 尝试恢复之前的训练
+    model, star, completed_stages = load_latest_checkpoint(config, device, latent_dim, dataset)
+
+    if model is None:
+        # 从头开始训练
+        model = StellarModel(
+            P_66xL=P,
+            latent_dim=latent_dim,
+            init_k1=torch.zeros(P.shape[1]),
+            dtype=dtype,
+        ).to(device)
+        star = init_star_params(dataset, device, latent_dim=latent_dim)
+        completed_stages = 0
+        print("Starting training from scratch.")
+    else:
+        print(f"Resuming from Stage {completed_stages + 1}")
+
+    # 6. 从下一阶段开始训练
+    stages = config["stages"]
+    start_stage_idx = completed_stages  # 已完成的数量（索引从0开始）
+
+    for stage_idx in range(start_stage_idx, len(stages)):
+        stage_config = stages[stage_idx]
+        stage_num = stage_idx + 1
+
+        print(f"\n{'='*60}")
+        print(f"Starting {stage_config['name']} (Stage {stage_num}/{len(stages)})")
+        print(f"{'='*60}")
+
+        try:
+            # 训练该阶段
+            train_stage(
+                model=model,
+                dataset=dataset,
+                star=star,
+                stage_config=stage_config,
+                stage_num=stage_num,
+                L_spec=L_spec,
+                device=device,
+                config=config,
             )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # 训练完成后立即保存
+            save_checkpoint(stage_num, model, star, config)
+            print(f"✓ Stage {stage_num} completed and saved.")
 
-    model = StellarModel(
-        P_66xL=P,
-        latent_dim=latent_dim,
-        init_k1=torch.zeros(P.shape[1]),
-    ).to(device)
+        except Exception as e:
+            print(f"✗ Stage {stage_num} interrupted: {e}")
+            print(f"Progress saved up to Stage {stage_num - 1}")
+            print("You can resume training by running this script again.")
+            raise  # 或者选择保存当前状态后退出
 
-    star = init_star_params(dataset, device, latent_dim=latent_dim)
-
-    train_stage(
-        model=model,
-        dataset=dataset,
-        L_spec=L_spec,
-        device=device,
-        epochs=512,
-        batch_size=1024,
-        lr=2e-4,
-        free_keys=(),
-        update_model=True,
-        train_k1=False,
-        star_params=star,
-        lambda_latent=1.0,
-        desc="Stage 1",
-    )
-
-    train_stage(
-        model=model,
-        dataset=dataset,
-        L_spec=L_spec,
-        device=device,
-        epochs=256,
-        batch_size=1024,
-        lr=2e-4,
-        free_keys=("latent",),
-        update_model=False,
-        train_k1=False,
-        star_params=star,
-        lambda_latent=1.0,
-        desc="Stage 2",
-    )
-
-    train_stage(
-        model=model,
-        dataset=dataset,
-        L_spec=L_spec,
-        device=device,
-        epochs=512,
-        batch_size=1024,
-        lr=1e-4,
-        free_keys=("latent",),
-        update_model=True,
-        train_k1=False,
-        star_params=star,
-        lambda_latent=1.0,
-        desc="Stage 3",
-    )
-
-    train_stage(
-        model=model,
-        dataset=dataset,
-        L_spec=L_spec,
-        device=device,
-        epochs=256,
-        batch_size=1024,
-        lr=1e-4,
-        free_keys=("x", "E", "plx", "latent"),
-        update_model=True,
-        train_k1=False,
-        star_params=star,
-        lambda_x=1.0,
-        lambda_E=1.0,
-        lambda_plx=1.0,
-        lambda_latent=1.0,
-        desc="Stage 4",
-    )
-
-def save_model(path, model, star_params):
+    # 7. 保存最终模型
+    final_model_path = config["training"]["final_model_path"]
     torch.save({
         "model_state": model.state_dict(),
-        "star_params": {
-            k: v.detach().cpu()
-            for k, v in star_params.items()
-        },
-    }, path)
+        "star_params": {k: v.detach().cpu() for k, v in star.items()},
+        "config": config,
+    }, final_model_path)
+    print(f"\n✓ All stages completed! Final model saved to {final_model_path}")
 
-save_model("stellar_model.pt", model, star)
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train stellar model with checkpoint resume")
+    parser.add_argument("--config", type=str, default="config.json", help="Path to config file")
+    args = parser.parse_args()
+
+    main(args.config)

@@ -1,0 +1,605 @@
+# deterministic_stellar_model.py
+from __future__ import annotations
+import os
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from torch.optim.lr_scheduler import StepLR
+
+import numpy as np
+import h5py
+from astropy.table import Table
+
+def save_as_h5(d, name):
+    print(f'Saving as {name}')
+    with h5py.File(name, 'w') as f:
+        for key in d.keys():
+            f[key] = d[key]
+    return 0
+
+
+def load_h5(name):
+    print(f'Loading {name}')
+    d = {}
+    with h5py.File(name, 'r') as f:
+        for key in f.keys():
+            d[key] = f[key][:]
+    return d     
+
+dtype=torch.float16
+
+
+# Build dataset
+class StellarDataset(Dataset):
+    def __init__(
+        self,
+        x: torch.Tensor,
+        E: torch.Tensor,
+        xi: torch.Tensor,
+        plx: torch.Tensor,
+        x_err: torch.Tensor,
+        E_err: torch.Tensor,
+        xi_err: torch.Tensor,
+        plx_err: torch.Tensor,
+        flux: torch.Tensor,
+        flux_sqrticov: torch.Tensor,
+        latent: Optional[torch.Tensor] = None,
+        latent_dim: int = 3,
+        dtype: torch.dtype = torch.float16,
+    ):
+        super().__init__()
+
+        self.x = x.to(dtype)
+        self.E = E.to(dtype).view(-1)
+        self.xi = xi.to(dtype).view(-1)
+        self.plx = plx.to(dtype).view(-1)
+
+        self.x_err = x_err.to(dtype)
+        self.E_err = E_err.to(dtype).view(-1)
+        self.xi_err = xi_err.to(dtype).view(-1)
+        self.plx_err = plx_err.to(dtype).view(-1)
+
+        self.flux = flux.to(dtype)
+        self.flux_sqrticov = flux_sqrticov.to(dtype)
+
+        n = self.x.shape[0]
+        self.latent = torch.zeros(n, latent_dim, dtype=dtype) if latent is None else latent.to(dtype)
+
+        assert self.E.numel() == n and self.xi.numel() == n and self.plx.numel() == n
+        assert self.latent.shape == (n, latent_dim)
+        assert self.flux.shape == (n, 66)
+        assert self.flux_sqrticov.shape == (n, 66, 66)
+
+    def __len__(self):
+        return self.x.shape[0]
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        return {
+            "idx": torch.tensor(idx, dtype=torch.long),
+            "x": self.x[idx],
+            "E": self.E[idx],
+            "xi": self.xi[idx],
+            "plx": self.plx[idx],
+            "x_err": self.x_err[idx],
+            "E_err": self.E_err[idx],
+            "xi_err": self.xi_err[idx],
+            "plx_err": self.plx_err[idx],
+            "latent": self.latent[idx],
+            "flux": self.flux[idx],
+            "flux_sqrticov": self.flux_sqrticov[idx],
+        }
+
+
+# -------------------------
+# 2) Fixed projection matrix P (build once)
+# -------------------------
+def build_P_66xL(
+    wave_hi_start=387.0,
+    wave_hi_end=997.0,
+    wave_hi_step=3.0,
+    wave_obs_start=392.0,
+    wave_obs_end=992.0,
+    wave_obs_step=10.0,
+    extra_bands=5,
+    dtype=torch.float16,
+    device="cpu",
+):
+    """
+    Build P (66, L), where first 61 rows interpolate a high-res optical grid to 61 observed optical points,
+    and last 5 rows pick the extra 5 bands directly.
+    """
+    wave_hi = torch.arange(wave_hi_start, wave_hi_end + 1e-6, wave_hi_step, dtype=dtype, device=device)   # (L_spec,)
+    wave_obs = torch.arange(wave_obs_start, wave_obs_end + 1e-6, wave_obs_step, dtype=dtype, device=device) # (61,)
+    
+    L_spec = wave_hi.numel()
+    L = L_spec + extra_bands
+
+    idx = torch.searchsorted(wave_hi, wave_obs)
+    idx = torch.clamp(idx, 1, L_spec - 1)
+
+    x0 = wave_hi[idx - 1]
+    x1 = wave_hi[idx]
+    t = (wave_obs - x0) / (x1 - x0)
+    w0 = 1 - t
+    w1 = t
+
+    P61 = torch.zeros(61, L_spec, dtype=dtype, device=device)
+    rows = torch.arange(61, device=device)
+    P61[rows, idx - 1] = w0
+    P61[rows, idx] = w1
+
+    P = torch.zeros(66, L, dtype=dtype, device=device)
+    P[:61, :L_spec] = P61
+
+    # last 5 dims are direct picks
+    for i in range(extra_bands):
+        P[61 + i, L_spec + i] = 1.0
+
+    return P, L_spec
+
+
+
+
+class StellarSpectrumModel(nn.Module):
+    def __init__(self, in_dim: int, L: int, hidden=256, depth=3, dtype=torch.float16):
+        super().__init__()
+        layers = []
+        d = in_dim
+        for _ in range(depth):
+            layers += [nn.Linear(d, hidden, dtype=dtype), nn.Tanh()]
+            d = hidden
+        layers.append(nn.Linear(d, L, dtype=dtype))
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        log_F = self.net(x)
+        #log_F = torch.clamp(log_F, -10.0, 10.0)  # 防止 exp 爆炸
+        return log_F
+    
+# -------------------------
+# 3) Modules with clean interfaces
+# -------------------------
+class ApplyExtinction(nn.Module):
+    """
+    A(λ) = E * tanh[ k0(λ) + xi * k1(λ) ]
+    F_obs = F_int * exp(-A)
+    """
+    def __init__(
+        self,
+        L: int,
+        init_k0: Optional[torch.Tensor] = None,
+        init_k1: Optional[torch.Tensor] = None,
+        dtype: torch.dtype = torch.float16,
+    ):
+        super().__init__()
+        if init_k0 is None:
+            wavelength_IRbands = np.array([1235, 1662, 2159, 3400, 4600])
+            init_k0 = torch.as_tensor(np.log(2 * (np.hstack([387.0 + np.arange(L-5) *3, wavelength_IRbands])/550.)**(-1.5)), dtype=dtype)
+        else:
+            init_k0 = torch.as_tensor(init_k0, dtype=dtype).view(-1)
+            assert init_k0.numel() == L
+
+        if init_k1 is None:
+            init_k1 = torch.as_tensor(np.arange(L) / L*0, dtype=dtype)
+        else:
+            init_k1 = torch.as_tensor(init_k1, dtype=dtype).view(-1)
+            assert init_k1.numel() == L
+
+        self.k0 = nn.Parameter(init_k0.clone())
+        self.k1 = nn.Parameter(init_k1.clone())
+
+    def forward(self, log_F_int: torch.Tensor, E: torch.Tensor, xi: torch.Tensor) -> torch.Tensor:
+        # F_int: (B,L), E: (B,), xi: (B,)
+        # extinction curves should always be positive. Use ln_Ext_curve 
+        # E can be still in this way
+        A = E[:, None] * torch.exp(self.k0[None, :] + torch.tanh(xi[:, None]) * self.k1[None, :])
+
+        return log_F_int  - A # Still in log space!
+
+
+# -------------------------
+# 4) Full model: forward(batch) only
+# -------------------------
+class StellarModel(nn.Module):
+    def __init__(
+        self,
+        P_66xL: torch.Tensor,
+        x_dim: int = 4,
+        latent_dim: int = 1,
+        init_k0: Optional[torch.Tensor] = None,
+        init_k1: Optional[torch.Tensor] = None,
+        dtype=torch.float16,
+    ):
+        super().__init__()
+
+        P_66xL = torch.as_tensor(P_66xL, dtype=dtype)
+        self.register_buffer("P", P_66xL)
+
+        L = P_66xL.shape[1]
+
+        self.spectrum_model = StellarSpectrumModel(
+            in_dim=x_dim + latent_dim,
+            L=L,
+            dtype=dtype,
+        )
+
+        self.extinction = ApplyExtinction(
+            L=L,
+            init_k0=init_k0,
+            init_k1=init_k1,
+            dtype=dtype,
+        )
+
+    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        x_pred = batch.get("x_pred", batch["x"])
+        E_pred = batch.get("E_pred", batch["E"]).view(-1)
+        xi_pred = batch.get("xi_pred", batch["xi"]).view(-1)
+        #log_plx_pred = batch.get("log_plx_pred", torch.log(batch["plx"])).view(-1)
+        log_plx_pred = batch.get(
+            "log_plx_pred",
+            torch.log(batch["plx"].clamp_min(1e-6))
+            ).view(-1)
+        latent = batch.get("latent_pred", batch["latent"])
+
+        # Make 2 different matrices
+        # One take the stellar parameters, another one take the latent parameter,
+        # hidden_1 = W_1 @ theta + W_2 @ latent
+        # In addition to penalty on latent parameters, add one more on the weights in W_2.
+        # Ask AI for penalties on the similarities between latent parameters and stellar parameters.
+
+        log_F_int = self.spectrum_model(torch.cat([x_pred, latent], dim=-1)) 
+        # No need for clamp min parallax; Use log parallax instead
+        log_F_int = log_F_int  + 2*log_plx_pred[:, None] 
+
+        log_F_obs = self.extinction(log_F_int, E_pred, xi_pred)
+        flux_pred = torch.exp(log_F_obs) @ self.P.T # Convert back to the flux space
+
+        return {
+            "flux_pred": flux_pred,
+            "log_F_int": log_F_int,
+            "log_F_obs": log_F_obs,
+            "ext_k0": self.extinction.k0,
+            "ext_k1": self.extinction.k1,
+            "latent": latent,
+            "xi_pred": xi_pred,
+        }
+
+
+
+# -------------------------
+# 5) Loss
+# -------------------------
+def compute_loss(
+    batch: Dict[str, torch.Tensor],
+    out: Dict[str, torch.Tensor],
+    L_spec: int,
+    lambda_xi: float = 1.0,
+    lambda_latent: float = 1.0,
+    lambda_smooth: float = 1e-3,
+    ) -> torch.Tensor:
+    d_flux = (batch["flux"] - out["flux_pred"]).unsqueeze(-1)
+    Wr = batch["flux_sqrticov"] @ d_flux
+    chi2_flux = Wr.squeeze(-1).pow(2).sum(dim=1)
+
+    # use observed xi as prior
+    xi_err = batch["xi_err"].clamp_min(1e-6)
+    chi2_xi = ((out["xi_pred"] - batch["xi"]) / xi_err).pow(2)
+
+    chi2_latent = out["latent"].pow(2).sum(dim=1)
+
+    log_F = out["log_F_int"][:, :L_spec]
+    d2 = log_F[:, 2:] - 2 * log_F[:, 1:-1] + log_F[:, :-2]
+    smooth = d2.pow(2).mean(dim=1)
+
+    k0 = out["ext_k0"][:L_spec]
+    k1 = out["ext_k1"][:L_spec]
+    d2_k0 = k0[2:] - 2 * k0[1:-1] + k0[:-2]
+    d2_k1 = k1[2:] - 2 * k1[1:-1] + k1[:-2]
+    smooth_ext = d2_k0.pow(2).mean() + d2_k1.pow(2).mean()
+
+    loss = (
+        chi2_flux
+        + lambda_xi * chi2_xi
+        + lambda_latent * chi2_latent 
+        + lambda_smooth * (smooth + smooth_ext)
+    )
+
+    return loss.mean()
+
+
+
+def init_star_params(dataset: Dataset, device: str, latent_dim: int = 3):
+    x0 = dataset.x.to(device)
+    E0 = dataset.E.to(device)
+    xi0 = dataset.xi.to(device)
+    plx0 = dataset.plx.to(device).clamp_min(1e-6)
+    N = len(dataset)
+
+    star = {
+        "x_pred": nn.Parameter(x0.clone()),
+        "E_pred": nn.Parameter(E0.clone().view(-1)),
+        "xi_pred": nn.Parameter(xi0.clone().view(-1)),
+        "log_plx_pred": nn.Parameter(torch.log(plx0.view(-1))),
+        "latent_pred": nn.Parameter(torch.randn(N, latent_dim, device=device)), # Perhaps too small?
+    }
+
+    return star
+
+
+
+def train_stage(
+    *,
+    model: nn.Module,
+    dataset,
+    L_spec: int,
+    device: str,
+    epochs: int,
+    batch_size: int = 128,
+    lr: float = 1e-4,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+    free_keys: Tuple[str, ...] = (),
+    update_model: bool = True,
+    train_k1: bool = True,
+    star_params: Dict[str, nn.Parameter] | None = None,
+    lambda_x: float = 1.0,
+    lambda_E: float = 1.0,
+    lambda_plx: float = 1.0,
+    lambda_xi: float = 0.0, # -> Set this to 0 intially, as we are not updating xi.
+    lambda_latent: float = 1.0,
+    lambda_latent_grad: float = 1.0,
+    lambda_smooth: float = 1.0, # -> Used to be 0.01, which seems too small.
+    desc: str = "Stage",
+):
+    free_keys = tuple(free_keys)
+    valid = {"x", "E", "xi", "plx", "latent"}
+
+    if any(k not in valid for k in free_keys):
+        raise ValueError(f"free_keys must be subset of {valid}, got {free_keys}")
+
+    if star_params is None:
+        raise ValueError("star_params must be provided.")
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
+    )
+
+    model.to(device)
+
+    trainables = []
+
+    if update_model:
+        for name, p in model.named_parameters():
+            if name == "extinction.k1" and not train_k1:
+                continue
+            trainables.append(p)
+
+    if "x" in free_keys:
+        trainables.append(star_params["x_pred"])
+    if "E" in free_keys:
+        trainables.append(star_params["E_pred"])
+    if "xi" in free_keys:
+        trainables.append(star_params["xi_pred"])
+    if "plx" in free_keys:
+        trainables.append(star_params["log_plx_pred"])
+    if "latent" in free_keys:
+        trainables.append(star_params["latent_pred"])
+
+    if len(trainables) == 0:
+        raise ValueError("No trainables selected.")
+
+    optimizer = torch.optim.Adam(trainables, lr=lr)
+
+    x0 = dataset.x.to(device)
+    E0 = dataset.E.to(device).view(-1)
+    plx0 = dataset.plx.to(device).view(-1).clamp_min(1e-6)
+
+    pbar = tqdm(range(epochs), desc=desc, dynamic_ncols=True)
+
+    for _ in pbar:
+        model.train()
+        total = 0.0
+
+        for batch in loader:
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            idx = batch["idx"].view(-1)
+
+            batch_fwd = dict(batch)
+            batch_fwd["latent_pred"] = star_params["latent_pred"][idx]
+
+            if "x" in free_keys:
+                batch_fwd["x_pred"] = star_params["x_pred"][idx]
+
+            if "E" in free_keys:
+                batch_fwd["E_pred"] = star_params["E_pred"][idx].view(-1)
+
+            if "xi" in free_keys:
+                batch_fwd["xi_pred"] = star_params["xi_pred"][idx].view(-1)
+
+            if "plx" in free_keys:
+                batch_fwd["log_plx_pred"] = star_params["log_plx_pred"][idx].view(-1)
+
+            out = model(batch_fwd)
+
+            loss = compute_loss(
+                batch,
+                out,
+                L_spec,
+                lambda_xi=lambda_xi,
+                lambda_latent=lambda_latent,
+                lambda_smooth=lambda_smooth,
+            )
+
+            if update_model and lambda_latent_grad != 0:
+                grad_logF_latent = torch.autograd.grad(
+                    outputs=out["log_F_int"][:, :L_spec].sum(),
+                    inputs=out["latent"],
+                    create_graph=True,
+                    retain_graph=True,
+                )[0]
+
+                latent_grad_loss = grad_logF_latent.pow(2).sum(dim=1).mean()
+                loss = loss + lambda_latent_grad * latent_grad_loss
+
+            prior_loss = 0.0
+
+            if "x" in free_keys:
+                x_err = batch["x_err"].clamp_min(1e-6)
+                prior_loss = prior_loss + lambda_x * (
+                    (star_params["x_pred"][idx] - x0[idx]) / x_err
+                ).pow(2).sum(dim=1).mean()
+
+            if "E" in free_keys:
+                E_err = batch["E_err"].view(-1).clamp_min(1e-6)
+                prior_loss = prior_loss + lambda_E * (
+                    (star_params["E_pred"][idx].view(-1) - E0[idx]) / E_err
+                ).pow(2).mean()
+
+            if "plx" in free_keys:
+                log_plx_pred = star_params["log_plx_pred"][idx].view(-1)
+                plx_err = batch["plx_err"].view(-1).clamp_min(1e-6)
+                sig_log_plx = (plx_err / plx0[idx]).clamp_min(1e-6)
+
+                prior_loss = prior_loss + lambda_plx * (
+                    (log_plx_pred - torch.log(plx0[idx])) / sig_log_plx
+                ).pow(2).mean()
+
+            loss = loss + prior_loss
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            total += loss.item()
+
+        pbar.set_postfix(loss=f"{total / len(loader):.3e}")
+
+
+
+## -------------------------
+## 7) Build P, create dataset/model, then train
+## -------------------------
+#if __name__ == "__main__":
+#    latent_dim = 2
+#    dataset_h5 = "data/stellar_dataset.h5"
+# 
+#    P, L_spec = build_P_66xL(dtype=dtype, device="cpu")
+#    print("P shape:", tuple(P.shape), "L_spec:", L_spec)
+#
+#    print(f"Loading dataset from {dataset_h5}")
+#    
+#
+#    with h5py.File(dataset_h5, "r") as f:
+#        dataset = StellarDataset(
+#            x=torch.from_numpy(f["x"][:]),
+#            E=torch.from_numpy(f["E"][:]),
+#            xi=torch.from_numpy(f["xi"][:]),
+#            plx=torch.from_numpy(f["plx"][:]),
+#            x_err=torch.from_numpy(f["x_err"][:]),
+#            E_err=torch.from_numpy(f["E_err"][:]),
+#            xi_err=torch.from_numpy(f["xi_err"][:]),
+#            plx_err=torch.from_numpy(f["plx_err"][:]),
+#            flux=torch.from_numpy(f["flux"][:]),
+#            flux_sqrticov=torch.from_numpy(f["flux_sqrticov"][:]),
+#            latent=torch.from_numpy(f["latent"][:]),
+#            latent_dim=latent_dim,
+#            )
+#
+#    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#
+#    model = StellarModel(
+#        P_66xL=P,
+#        latent_dim=latent_dim,
+#        init_k1=torch.zeros(P.shape[1]),
+#    ).to(device)
+#
+#    star = init_star_params(dataset, device, latent_dim=latent_dim)
+#
+#    train_stage(
+#        model=model,
+#        dataset=dataset,
+#        L_spec=L_spec,
+#        device=device,
+#        epochs=512,
+#        batch_size=1024,
+#        lr=2e-4,
+#        free_keys=(),
+#        update_model=True,
+#        train_k1=False,
+#        star_params=star,
+#        lambda_latent=1.0,
+#        desc="Stage 1",
+#    )
+#
+#    train_stage(
+#        model=model,
+#        dataset=dataset,
+#        L_spec=L_spec,
+#        device=device,
+#        epochs=256,
+#        batch_size=1024,
+#        lr=2e-4,
+#        free_keys=("latent",),
+#        update_model=False,
+#        train_k1=False,
+#        star_params=star,
+#        lambda_latent=1.0,
+#        desc="Stage 2",
+#    )
+#
+#    train_stage(
+#        model=model,
+#        dataset=dataset,
+#        L_spec=L_spec,
+#        device=device,
+#        epochs=512,
+#        batch_size=1024,
+#        lr=1e-4,
+#        free_keys=("latent",),
+#        update_model=True,
+#        train_k1=False,
+#        star_params=star,
+#        lambda_latent=1.0,
+#        desc="Stage 3",
+#    )
+#
+#    train_stage(
+#        model=model,
+#        dataset=dataset,
+#        L_spec=L_spec,
+#        device=device,
+#        epochs=256,
+#        batch_size=1024,
+#        lr=1e-4,
+#        free_keys=("x", "E", "plx", "latent"),
+#        update_model=True,
+#        train_k1=False,
+#        star_params=star,
+#        lambda_x=1.0,
+#        lambda_E=1.0,
+#        lambda_plx=1.0,
+#        lambda_latent=1.0,
+#        desc="Stage 4",
+#    )
+#
+#    def save_model(path, model, star_params):
+#        torch.save({
+#            "model_state": model.state_dict(),
+#            "star_params": {
+#                k: v.detach().cpu()
+#                for k, v in star_params.items()
+#            },
+#        }, path)
+#
+#    save_model("stellar_model.pt", model, star)
