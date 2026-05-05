@@ -11,6 +11,9 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from torch.optim.lr_scheduler import StepLR
 
+# === CHANGED: 导入 vmap/jacrev ===
+from torch.func import vmap, jacrev
+
 import numpy as np
 import h5py
 from astropy.table import Table
@@ -353,6 +356,7 @@ def train_stage(
     if star_params is None:
         raise ValueError("star_params must be provided.")
 
+    # === CHANGED: DataLoader 优化 (num_workers > 0 时开启 persistent_workers) ===
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -360,6 +364,7 @@ def train_stage(
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
     )
 
     model.to(device)
@@ -388,6 +393,9 @@ def train_stage(
 
     optimizer = torch.optim.Adam(trainables, lr=lr)
 
+    # === CHANGED: GradScaler 用于混合精度 ===
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+
     x0 = dataset.x.to(device)
     E0 = dataset.E.to(device).view(-1)
     plx0 = dataset.plx.to(device).view(-1).clamp_min(1e-6)
@@ -415,7 +423,9 @@ def train_stage(
             if "plx" in free_keys:
                 batch_fwd["log_plx_pred"] = star_params["log_plx_pred"][idx].view(-1)
 
-            out = model(batch_fwd)
+            # === CHANGED: 模型前向包裹在 autocast 中 (FP16)，loss 在外面 (FP32) ===
+            with torch.amp.autocast('cuda', dtype=torch.float16):
+                out = model(batch_fwd)
 
             loss = compute_loss(
                 batch,
@@ -426,14 +436,27 @@ def train_stage(
                 lambda_smooth=lambda_smooth,
             )
 
+            # === CHANGED: 用 vmap/jacrev 替换原来的 autograd.grad ===
             if update_model and lambda_latent_grad != 0:
-                grad_logF_latent = torch.autograd.grad(
-                    outputs=out["log_F_int"][:, :L_spec].sum(),
-                    inputs=out["latent"],
-                    create_graph=True,
-                    retain_graph=True,
-                )[0]
-                latent_grad_loss = grad_logF_latent.pow(2).sum(dim=1).mean()
+                x_det = batch_fwd.get("x_pred", batch_fwd["x"]).detach()
+                plx_det = batch_fwd.get(
+                    "log_plx_pred",
+                    torch.log(batch_fwd["plx"].clamp_min(1e-6))
+                ).detach()
+
+                def single_spec_fn(lat_1, x_1, plx_1):
+                    log_F_int = model.spectrum_model(
+                        torch.cat([x_1, lat_1]).unsqueeze(0)
+                    )
+                    log_F_int = log_F_int + 2 * plx_1.unsqueeze(0)
+                    return log_F_int[0, :L_spec]
+
+                jac = vmap(jacrev(single_spec_fn), in_dims=(0, 0, 0))(
+                    out["latent"],
+                    x_det,
+                    plx_det,
+                )
+                latent_grad_loss = jac.pow(2).sum(dim=(1, 2)).mean()
                 loss = loss + lambda_latent_grad * latent_grad_loss
 
             prior_loss = 0.0
@@ -461,12 +484,18 @@ def train_stage(
             loss = loss + prior_loss
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(trainables, max_norm=1.0)
-            
-            optimizer.step()
+
+            # === CHANGED: 混合精度 backward + step ===
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(trainables, max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainables, max_norm=1.0)
+                optimizer.step()
 
             total += loss.item()
             n_batches += 1
@@ -523,6 +552,7 @@ if __name__ == "__main__":
         epochs=512,
         batch_size=1024,
         lr=2e-4,
+        num_workers=4,  # === CHANGED ===
         free_keys=(),
         update_model=True,
         train_k1=False,
@@ -539,6 +569,7 @@ if __name__ == "__main__":
         epochs=256,
         batch_size=1024,
         lr=2e-4,
+        num_workers=4,  # === CHANGED ===
         free_keys=("latent",),
         update_model=False,
         train_k1=False,
@@ -555,6 +586,7 @@ if __name__ == "__main__":
         epochs=512,
         batch_size=1024,
         lr=1e-4,
+        num_workers=4,  # === CHANGED ===
         free_keys=("latent",),
         update_model=True,
         train_k1=False,
@@ -571,6 +603,7 @@ if __name__ == "__main__":
         epochs=256,
         batch_size=1024,
         lr=1e-4,
+        num_workers=4,  # === CHANGED ===
         free_keys=("x", "E", "plx", "latent"),
         update_model=True,
         train_k1=False,
