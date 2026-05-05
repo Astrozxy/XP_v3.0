@@ -315,10 +315,10 @@ def compute_loss(
 
 
 def init_star_params(dataset: Dataset, device: str, latent_dim: int = 3):
-    x0 = dataset.x.to(device)
-    E0 = dataset.E.to(device)
-    xi0 = dataset.xi.to(device)
-    plx0 = dataset.plx.to(device).clamp_min(1e-6)
+    x0 = dataset.x.to(device).to(dtype)
+    E0 = dataset.E.to(device).to(dtype)
+    xi0 = dataset.xi.to(device).to(dtype)
+    plx0 = dataset.plx.to(device).to(dtype).clamp_min(1e-6)
     N = len(dataset)
 
     star = {
@@ -326,7 +326,7 @@ def init_star_params(dataset: Dataset, device: str, latent_dim: int = 3):
         "E_pred": nn.Parameter(E0.clone().view(-1)),
         "xi_pred": nn.Parameter(xi0.clone().view(-1)),
         "log_plx_pred": nn.Parameter(torch.log(plx0.view(-1))),
-        "latent_pred": nn.Parameter(torch.randn(N, latent_dim, device=device)), # Perhaps too small?
+        "latent_pred": nn.Parameter(torch.randn(N, latent_dim, device=device, dtype=dtype)), # Perhaps too small?
     }
 
     return star

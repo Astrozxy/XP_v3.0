@@ -1,5 +1,3 @@
-from model import *
-
 from __future__ import annotations
 import os
 import json
@@ -18,6 +16,7 @@ import numpy as np
 import h5py
 from astropy.table import Table
 
+from model import *
 # ========== 你的原始模型代码（保持不变）==========
 # ... 这里放置你原来的所有类定义 ...
 # StellarDataset, build_P_66xL, StellarSpectrumModel,
@@ -113,26 +112,17 @@ def load_latest_checkpoint(config, device, latent_dim, dataset):
 
     # 重建 star 参数
     star_values = checkpoint["star_params"]
+    dtype = dataset.x.dtype if hasattr(dataset, 'x') else config["model"]["dtype"]
     star = {
-        "x_pred": nn.Parameter(star_values["x_pred"].to(device)),
-        "E_pred": nn.Parameter(star_values["E_pred"].to(device).view(-1)),
-        "xi_pred": nn.Parameter(star_values["xi_pred"].to(device).view(-1)),
-        "log_plx_pred": nn.Parameter(star_values["log_plx_pred"].to(device).view(-1)),
-        "latent_pred": nn.Parameter(star_values["latent_pred"].to(device)),
+        "x_pred": nn.Parameter(star_values["x_pred"].to(device).to(dtype)),
+        "E_pred": nn.Parameter(star_values["E_pred"].to(device).to(dtype).view(-1)),
+        "xi_pred": nn.Parameter(star_values["xi_pred"].to(device).to(dtype).view(-1)),
+        "log_plx_pred": nn.Parameter(star_values["log_plx_pred"].to(device).to(dtype).view(-1)),
+        "latent_pred": nn.Parameter(star_values["latent_pred"].to(device).to(dtype)),
     }
 
     return model, star, latest_stage
 
-def recreate_star_params(star_values, device, latent_dim):
-    """从保存的值重新创建 star 参数字典"""
-    star = {
-        "x_pred": nn.Parameter(star_values["x_pred"].to(device)),
-        "E_pred": nn.Parameter(star_values["E_pred"].to(device).view(-1)),
-        "xi_pred": nn.Parameter(star_values["xi_pred"].to(device).view(-1)),
-        "log_plx_pred": nn.Parameter(star_values["log_plx_pred"].to(device).view(-1)),
-        "latent_pred": nn.Parameter(star_values["latent_pred"].to(device)),
-    }
-    return star
 
 def train_stage_from_config(
     model, dataset, star, stage_config, stage_num,
@@ -221,6 +211,16 @@ def main(config_path="config.json"):
             dtype=dtype,
         ).to(device)
         star = init_star_params(dataset, device, latent_dim=latent_dim)
+        
+        # 检查 dtype
+        print(f"dataset.x dtype: {dataset.x.dtype}")
+        print(f"star x_pred dtype: {star['x_pred'].dtype}")
+        print(f"star latent_pred dtype: {star['latent_pred'].dtype}")
+        print(f"model param dtype: {next(model.parameters()).dtype}")
+
+        assert star['x_pred'].dtype == star['latent_pred'].dtype == next(model.parameters()).dtype
+
+
         completed_stages = 0
         print("Starting training from scratch.")
     else:
@@ -240,7 +240,7 @@ def main(config_path="config.json"):
 
         try:
             # 训练该阶段
-            train_stage(
+            train_stage_from_config(
                 model=model,
                 dataset=dataset,
                 star=star,
