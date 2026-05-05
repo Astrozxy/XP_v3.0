@@ -64,11 +64,7 @@ class StellarDataset(Dataset):
         self.xi_err = xi_err.to(dtype).view(-1)
         self.plx_err = plx_err.to(dtype).view(-1)
 
-        # 清理 flux 中的 Inf
         self.flux = flux.to(dtype)
-        self.flux = torch.where(torch.isinf(self.flux), torch.zeros_like(self.flux), self.flux)
-        self.flux = torch.where(torch.isnan(self.flux), torch.zeros_like(self.flux), self.flux)
-        
         self.flux_sqrticov = flux_sqrticov.to(dtype)
 
         n = self.x.shape[0]
@@ -160,7 +156,6 @@ class StellarSpectrumModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         log_F = self.net(x)
-        log_F = torch.clamp(log_F, -20, 20)
         return log_F
 
 
@@ -197,13 +192,7 @@ class ApplyExtinction(nn.Module):
         self.k1 = nn.Parameter(init_k1.clone())
 
     def forward(self, log_F_int: torch.Tensor, E: torch.Tensor, xi: torch.Tensor) -> torch.Tensor:
-        # 裁剪输入防止数值问题
-        E = torch.clamp(E, min=0, max=10)
-        xi = torch.clamp(xi, min=-5, max=5)
-        
         A = E[:, None] * torch.exp(self.k0[None, :] + torch.tanh(xi[:, None]) * self.k1[None, :])
-        A = torch.clamp(A, min=0, max=20)
-        
         return log_F_int - A
 
 
@@ -245,7 +234,7 @@ class StellarModel(nn.Module):
         E_pred = batch.get("E_pred", batch["E"]).view(-1)
         xi_pred = batch.get("xi_pred", batch["xi"]).view(-1)
         
-        # 安全处理 parallax: 负的 parallax 用 1e-6 替代
+        # 安全处理 parallax: 负的 parallax 用 1e-6 替代（这是必要的，因为 log 不能接受负数）
         plx_safe = batch["plx"].clamp_min(1e-6)
         log_plx_pred = batch.get(
             "log_plx_pred",
@@ -255,16 +244,10 @@ class StellarModel(nn.Module):
         latent = batch.get("latent_pred", batch["latent"])
 
         log_F_int = self.spectrum_model(torch.cat([x_pred, latent], dim=-1))
-        log_F_int = torch.clamp(log_F_int, -20, 20)
-        
         log_F_int = log_F_int + 2 * log_plx_pred[:, None]
-        log_F_int = torch.clamp(log_F_int, -20, 20)
 
         log_F_obs = self.extinction(log_F_int, E_pred, xi_pred)
-        log_F_obs = torch.clamp(log_F_obs, -20, 10)
-        
         flux_pred = torch.exp(log_F_obs) @ self.P.T
-        flux_pred = torch.clamp(flux_pred, min=0, max=1e5)
 
         return {
             "flux_pred": flux_pred,
@@ -288,24 +271,18 @@ def compute_loss(
     lambda_latent: float = 1.0,
     lambda_smooth: float = 1e-3,
 ) -> torch.Tensor:
-    eps = 1e-8
-    
     d_flux = (batch["flux"] - out["flux_pred"]).unsqueeze(-1)
     Wr = batch["flux_sqrticov"] @ d_flux
     chi2_flux = Wr.squeeze(-1).pow(2).sum(dim=1)
-    chi2_flux = torch.clamp(chi2_flux, min=0, max=1e6)
 
-    xi_err = batch["xi_err"].clamp_min(eps)
+    xi_err = batch["xi_err"].clamp_min(1e-6)
     chi2_xi = ((out["xi_pred"] - batch["xi"]) / xi_err).pow(2)
-    chi2_xi = torch.clamp(chi2_xi, min=0, max=1e6)
 
     chi2_latent = out["latent"].pow(2).sum(dim=1)
-    chi2_latent = torch.clamp(chi2_latent, min=0, max=1e6)
 
     log_F = out["log_F_int"][:, :L_spec]
     d2 = log_F[:, 2:] - 2 * log_F[:, 1:-1] + log_F[:, :-2]
     smooth = d2.pow(2).mean(dim=1)
-    smooth = torch.clamp(smooth, min=0, max=1e6)
 
     k0 = out["ext_k0"][:L_spec]
     k1 = out["ext_k1"][:L_spec]
@@ -319,8 +296,6 @@ def compute_loss(
         + lambda_latent * chi2_latent 
         + lambda_smooth * (smooth + smooth_ext)
     )
-    
-    loss = torch.clamp(loss, min=0, max=1e6)
 
     return loss.mean()
 
@@ -428,10 +403,6 @@ def train_stage(
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             idx = batch["idx"].view(-1)
 
-            # 清理 batch 中的 flux
-            if torch.isinf(batch["flux"]).any():
-                batch["flux"] = torch.where(torch.isinf(batch["flux"]), torch.zeros_like(batch["flux"]), batch["flux"])
-
             batch_fwd = dict(batch)
             batch_fwd["latent_pred"] = star_params["latent_pred"][idx]
 
@@ -488,10 +459,6 @@ def train_stage(
                 ).pow(2).mean()
 
             loss = loss + prior_loss
-
-            # 跳过无效 loss
-            if torch.isnan(loss) or torch.isinf(loss):
-                continue
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
