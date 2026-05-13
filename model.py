@@ -1,4 +1,4 @@
-# deterministic_stellar_model.py
+# model.py
 from __future__ import annotations
 import os
 from dataclasses import dataclass
@@ -11,12 +11,29 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from torch.optim.lr_scheduler import StepLR
 
-# === CHANGED: 导入 vmap/jacrev ===
-from torch.func import vmap, jacrev
+from torch.func import vmap, grad
 
 import numpy as np
 import h5py
 from astropy.table import Table
+
+import matplotlib.pyplot as plt
+
+import torch.distributed as dist
+
+def is_distributed():
+    return dist.is_available() and dist.is_initialized()
+
+def get_rank():
+    if is_distributed():
+        return dist.get_rank()
+    return 0
+
+def get_world_size():
+    if is_distributed():
+        return dist.get_world_size()
+    return 1
+
 
 def save_as_h5(d, name):
     print(f'Saving as {name}')
@@ -35,7 +52,6 @@ def load_h5(name):
     return d     
 
 dtype = torch.float32
-
 
 # Build dataset
 class StellarDataset(Dataset):
@@ -145,6 +161,7 @@ def build_P_66xL(
     return P, L_spec
 
 
+
 class StellarSpectrumModel(nn.Module):
     def __init__(self, in_dim: int, L: int, hidden=256, depth=3, dtype=torch.float32):
         super().__init__()
@@ -194,7 +211,12 @@ class ApplyExtinction(nn.Module):
         self.k0 = nn.Parameter(init_k0.clone())
         self.k1 = nn.Parameter(init_k1.clone())
 
-    def forward(self, log_F_int: torch.Tensor, E: torch.Tensor, xi: torch.Tensor) -> torch.Tensor:
+    def forward(self, log_F_int: torch.Tensor, log_E: torch.Tensor, xi: torch.Tensor) -> torch.Tensor:
+        """
+        A(λ) = exp(log_E) * exp[ k0(λ) + tanh(xi) * k1(λ) ]
+        F_obs = F_int * exp(-A)
+        """
+        E = torch.exp(log_E)  
         A = E[:, None] * torch.exp(self.k0[None, :] + torch.tanh(xi[:, None]) * self.k1[None, :])
         return log_F_int - A
 
@@ -234,32 +256,40 @@ class StellarModel(nn.Module):
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         x_pred = batch.get("x_pred", batch["x"])
-        E_pred = batch.get("E_pred", batch["E"]).view(-1)
+        # ---- 处理 E：期望收到 logE，若收到原始线性 E 则转换 ----
+        if "log_E_pred" in batch:
+            log_E = batch["log_E_pred"].view(-1)    
+        else:
+            log_E = torch.log(batch["E"].clamp_min(1e-6)).view(-1)   # 推理或无自由 E 时用线性 E 转 logE
+    
         xi_pred = batch.get("xi_pred", batch["xi"]).view(-1)
-        
-        # 安全处理 parallax: 负的 parallax 用 1e-6 替代（这是必要的，因为 log 不能接受负数）
+    
         plx_safe = batch["plx"].clamp_min(1e-6)
-        log_plx_pred = batch.get(
-            "log_plx_pred",
-            torch.log(plx_safe)
-        ).view(-1)
-        
+        log_plx_pred = batch.get("log_plx_pred", torch.log(plx_safe)).view(-1)
+    
         latent = batch.get("latent_pred", batch["latent"])
-
+    
+        # ---- 光谱网络（MLP）正常接受 autocast 控制，可能 FP16 ----
         log_F_int = self.spectrum_model(torch.cat([x_pred, latent], dim=-1))
         log_F_int = log_F_int + 2 * log_plx_pred[:, None]
-
-        log_F_obs = self.extinction(log_F_int, E_pred, xi_pred)
-        flux_pred = torch.exp(log_F_obs) @ self.P.T
-
+    
+        # ---- 强制以下所有含 exp 的运算使用 FP32，防止溢出 ----
+        log_F_int_fp32 = log_F_int.float()
+        log_E_fp32 = log_E.float()                # logE 保持 float32
+        xi_pred_fp32 = xi_pred.float()
+    
+        with torch.amp.autocast('cuda', enabled=False):
+            log_F_obs = self.extinction(log_F_int_fp32, log_E_fp32, xi_pred_fp32)  # 传入 logE
+            flux_pred = torch.exp(log_F_obs) @ self.P.T.to(log_F_obs.dtype)
+    
         return {
             "flux_pred": flux_pred,
-            "log_F_int": log_F_int,
-            "log_F_obs": log_F_obs,
+            "log_F_int": log_F_int_fp32,
+            #"log_F_obs": log_F_obs,
             "ext_k0": self.extinction.k0,
             "ext_k1": self.extinction.k1,
             "latent": latent,
-            "xi_pred": xi_pred,
+            "xi_pred": xi_pred_fp32,    # 保持返回 FP32 的 xi_pred 用于 loss
         }
 
 
@@ -272,7 +302,8 @@ def compute_loss(
     L_spec: int,
     lambda_xi: float = 1.0,
     lambda_latent: float = 1.0,
-    lambda_smooth: float = 1e-3,
+    lambda_smooth: float = 1e-3,          # 现在只用于光谱平滑
+    lambda_smooth_ext: float = 1e-3,      # 新增：消光曲线平滑
 ) -> torch.Tensor:
     d_flux = (batch["flux"] - out["flux_pred"]).unsqueeze(-1)
     Wr = batch["flux_sqrticov"] @ d_flux
@@ -283,10 +314,12 @@ def compute_loss(
 
     chi2_latent = out["latent"].pow(2).sum(dim=1)
 
-    log_F = out["log_F_int"][:, :L_spec]
-    d2 = log_F[:, 2:] - 2 * log_F[:, 1:-1] + log_F[:, :-2]
-    smooth = d2.pow(2).mean(dim=1)
+    # 光谱平滑：只对光学部分（前 L_spec 个点）
+    log_F_pred = out["log_F_int"][:, :L_spec]
+    d2 = log_F_pred[:, 2:] - 2 * log_F_pred[:, 1:-1] + log_F_pred[:, :-2]
+    smooth_flux = d2.pow(2).mean(dim=1)
 
+    # 消光曲线平滑：也只对光学部分
     k0 = out["ext_k0"][:L_spec]
     k1 = out["ext_k1"][:L_spec]
     d2_k0 = k0[2:] - 2 * k0[1:-1] + k0[:-2]
@@ -297,7 +330,8 @@ def compute_loss(
         chi2_flux
         + lambda_xi * chi2_xi
         + lambda_latent * chi2_latent 
-        + lambda_smooth * (smooth + smooth_ext)
+        + lambda_smooth * smooth_flux          # 分开加权
+        + lambda_smooth_ext * smooth_ext       # 分开加权
     )
 
     return loss.mean()
@@ -307,17 +341,17 @@ def init_star_params(dataset: Dataset, device: str, latent_dim: int = 3):
     dtype = dataset.x.dtype
     
     x0 = dataset.x.to(device)
-    E0 = dataset.E.to(device)
-    xi0 = dataset.xi.to(device)
-    plx0 = dataset.plx.to(device).clamp_min(1e-6)
+    E0 = dataset.E.to(device).view(-1).clamp_min(1e-6)    # 防止 log(0)
+    xi0 = dataset.xi.to(device).view(-1)
+    plx0 = dataset.plx.to(device).view(-1).clamp_min(1e-6)
     N = len(dataset)
 
     star = {
         "x_pred": nn.Parameter(x0.clone()),
-        "E_pred": nn.Parameter(E0.clone().view(-1)),
-        "xi_pred": nn.Parameter(xi0.clone().view(-1)),
-        "log_plx_pred": nn.Parameter(torch.log(plx0.view(-1))),
-        "latent_pred": nn.Parameter(torch.randn(N, latent_dim, device=device, dtype=dtype)),
+        "log_E_pred": nn.Parameter(torch.log(E0)),             # 初始化为 logE
+        "xi_pred": nn.Parameter(xi0.clone()),
+        "log_plx_pred": nn.Parameter(torch.log(plx0)),
+        "latent_pred": nn.Parameter(1e-2 * torch.randn(N, latent_dim, device=device, dtype=dtype)),
     }
 
     return star
@@ -332,6 +366,10 @@ def train_stage(
     epochs: int,
     batch_size: int = 128,
     lr: float = 1e-4,
+    lr_schedule: str = "plateau",
+    step_size: int = 50,
+    gamma: float = 0.5,
+    patience: int = 50,
     num_workers: int = 0,
     pin_memory: bool = True,
     free_keys: Tuple[str, ...] = (),
@@ -345,42 +383,77 @@ def train_stage(
     lambda_latent: float = 1.0,
     lambda_latent_grad: float = 1.0,
     lambda_smooth: float = 1.0,
+    lambda_smooth_ext: float = 1.0,
     desc: str = "Stage",
 ):
     free_keys = tuple(free_keys)
     valid = {"x", "E", "xi", "plx", "latent"}
-
     if any(k not in valid for k in free_keys):
         raise ValueError(f"free_keys must be subset of {valid}, got {free_keys}")
-
     if star_params is None:
         raise ValueError("star_params must be provided.")
 
-    # === CHANGED: DataLoader 优化 (num_workers > 0 时开启 persistent_workers) ===
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=2 if num_workers > 0 else None,
-    )
+    # ---- 分布式信息 ----
+    is_dist = dist.is_available() and dist.is_initialized()
+    world_size = dist.get_world_size() if is_dist else 1
+    rank = dist.get_rank() if is_dist else 0
 
+    # ---- 设备处理 ----
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    # ---- DataLoader ----
+    if is_dist:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=2 if num_workers > 0 else None,
+        )
+    else:
+        sampler = None
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=2 if num_workers > 0 else None,
+        )
+
+    # ---- 模型 ----
     model.to(device)
+    if is_dist:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[device] if device.type == 'cuda' else None,
+            output_device=device if device.type == 'cuda' else None,
+        )
+    base_model = model.module if is_dist else model
 
+    # ---- 可训练参数 ----
     trainables = []
-
     if update_model:
         for name, p in model.named_parameters():
-            if name == "extinction.k1" and not train_k1:
+            clean_name = name.replace("module.", "")
+            if clean_name == "extinction.k1" and not train_k1:
                 continue
             trainables.append(p)
 
     if "x" in free_keys:
         trainables.append(star_params["x_pred"])
     if "E" in free_keys:
-        trainables.append(star_params["E_pred"])
+        trainables.append(star_params["log_E_pred"])
     if "xi" in free_keys:
         trainables.append(star_params["xi_pred"])
     if "plx" in free_keys:
@@ -391,23 +464,44 @@ def train_stage(
     if len(trainables) == 0:
         raise ValueError("No trainables selected.")
 
+    # ---- 优化器与调度器 ----
     optimizer = torch.optim.Adam(trainables, lr=lr)
 
-    # === CHANGED: GradScaler 用于混合精度 ===
+    if lr_schedule == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+    elif lr_schedule == "exp":
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
+    elif lr_schedule == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=gamma, patience=patience)
+    else:
+        scheduler = None
+
+    # ---- 混合精度 ----
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 
+    # ---- 先验数据 ----
     x0 = dataset.x.to(device)
     E0 = dataset.E.to(device).view(-1)
     plx0 = dataset.plx.to(device).view(-1).clamp_min(1e-6)
 
-    pbar = tqdm(range(epochs), desc=desc, dynamic_ncols=True)
+    # ---- 进度条 ----
+    if rank == 0:
+        pbar = tqdm(range(epochs), desc=desc, dynamic_ncols=True)
+    else:
+        pbar = range(epochs)
 
     for epoch in pbar:
+        if is_dist:
+            sampler.set_epoch(epoch)
+
         model.train()
-        total = 0.0
+        total_loss = 0.0
         n_batches = 0
 
         for batch in loader:
+            # ---- 新增：标记 CUDA graph 步进点，防止 tensor 覆盖错误 ----
+            torch.compiler.cudagraph_mark_step_begin()
+
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             idx = batch["idx"].view(-1)
 
@@ -417,13 +511,12 @@ def train_stage(
             if "x" in free_keys:
                 batch_fwd["x_pred"] = star_params["x_pred"][idx]
             if "E" in free_keys:
-                batch_fwd["E_pred"] = star_params["E_pred"][idx].view(-1)
+                batch_fwd["log_E_pred"] = star_params["log_E_pred"][idx].view(-1)
             if "xi" in free_keys:
                 batch_fwd["xi_pred"] = star_params["xi_pred"][idx].view(-1)
             if "plx" in free_keys:
                 batch_fwd["log_plx_pred"] = star_params["log_plx_pred"][idx].view(-1)
 
-            # === CHANGED: 模型前向包裹在 autocast 中 (FP16)，loss 在外面 (FP32) ===
             with torch.amp.autocast('cuda', dtype=torch.float16):
                 out = model(batch_fwd)
 
@@ -434,9 +527,10 @@ def train_stage(
                 lambda_xi=lambda_xi,
                 lambda_latent=lambda_latent,
                 lambda_smooth=lambda_smooth,
+                lambda_smooth_ext=lambda_smooth_ext
             )
 
-            # === CHANGED: 用 vmap/jacrev 替换原来的 autograd.grad ===
+            # ---- 潜变量梯度惩罚 ----
             if update_model and lambda_latent_grad != 0:
                 x_det = batch_fwd.get("x_pred", batch_fwd["x"]).detach()
                 plx_det = batch_fwd.get(
@@ -444,48 +538,48 @@ def train_stage(
                     torch.log(batch_fwd["plx"].clamp_min(1e-6))
                 ).detach()
 
-                def single_spec_fn(lat_1, x_1, plx_1):
-                    log_F_int = model.spectrum_model(
+                def sum_spec_fn(lat_1, x_1, plx_1):
+                    log_F_int = base_model.spectrum_model(
                         torch.cat([x_1, lat_1]).unsqueeze(0)
                     )
                     log_F_int = log_F_int + 2 * plx_1.unsqueeze(0)
-                    return log_F_int[0, :L_spec]
+                    return log_F_int[0, :L_spec].sum()
 
-                jac = vmap(jacrev(single_spec_fn), in_dims=(0, 0, 0))(
+                grad_latent = vmap(grad(sum_spec_fn), in_dims=(0, 0, 0))(
                     out["latent"],
                     x_det,
                     plx_det,
                 )
-                latent_grad_loss = jac.pow(2).sum(dim=(1, 2)).mean()
+                latent_grad_loss = grad_latent.pow(2).sum(dim=1).mean()
                 loss = loss + lambda_latent_grad * latent_grad_loss
 
-            prior_loss = 0.0
-
+            # ---- 先验惩罚 ----
+            prior_loss = torch.tensor(0.0, device=device)
             if "x" in free_keys:
                 x_err = batch["x_err"].clamp_min(1e-6)
                 prior_loss = prior_loss + lambda_x * (
                     (star_params["x_pred"][idx] - x0[idx]) / x_err
                 ).pow(2).sum(dim=1).mean()
-
             if "E" in free_keys:
                 E_err = batch["E_err"].view(-1).clamp_min(1e-6)
+                # 将 logE 转回线性 E
+                E_pred_lin = torch.exp(star_params["log_E_pred"][idx].view(-1))
                 prior_loss = prior_loss + lambda_E * (
-                    (star_params["E_pred"][idx].view(-1) - E0[idx]) / E_err
-                ).pow(2).mean()
-
+                    (E_pred_lin - E0[idx]) / E_err
+                    -2*star_params["log_E_pred"][idx].view(-1)
+                ).pow(2).mean() 
             if "plx" in free_keys:
                 log_plx_pred = star_params["log_plx_pred"][idx].view(-1)
                 plx_err = batch["plx_err"].view(-1).clamp_min(1e-6)
                 sig_log_plx = (plx_err / plx0[idx]).clamp_min(1e-6)
                 prior_loss = prior_loss + lambda_plx * (
                     (log_plx_pred - torch.log(plx0[idx])) / sig_log_plx
+                    -2*log_plx_pred
                 ).pow(2).mean()
 
             loss = loss + prior_loss
 
             optimizer.zero_grad(set_to_none=True)
-
-            # === CHANGED: 混合精度 backward + step ===
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -494,28 +588,44 @@ def train_stage(
                 scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(trainables, max_norm=1.0)
                 optimizer.step()
 
-            total += loss.item()
+            total_loss += loss.item()
             n_batches += 1
 
-        if n_batches > 0:
-            pbar.set_postfix(loss=f"{total / n_batches:.3e}")
+        # ---- epoch 结束：更新学习率调度器 ----
+        avg_loss = total_loss / n_batches if n_batches > 0 else 0.0
+        if scheduler is not None:
+            if lr_schedule == "plateau":
+                scheduler.step(avg_loss)
+            else:
+                scheduler.step()
 
+        # ---- 更新进度条 ----
+        if rank == 0 and n_batches > 0:
+            current_lr = optimizer.param_groups[0]['lr']
+            pbar.set_postfix(loss=f"{avg_loss:.3e}", lr=f"{current_lr:.2e}")
 
-## -------------------------
-## 7) Build P, create dataset/model, then train
-## -------------------------
+    if rank == 0 and hasattr(pbar, 'close'):
+        pbar.close()
+
 if __name__ == "__main__":
-    latent_dim = 2
-    dataset_h5 = "data/stellar_dataset.h5"
- 
-    P, L_spec = build_P_66xL(dtype=dtype, device="cpu")
-    print("P shape:", tuple(P.shape), "L_spec:", L_spec)
+    import torch.distributed as dist
 
-    print(f"Loading dataset from {dataset_h5}")
-    
+    # ---- 分布式初始化（torchrun 自动设置环境变量）----
+    dist.init_process_group("nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    # ---- 超参数 ----
+    latent_dim = 2
+    dataset_h5 = "data/stellar_dataset_1pct.h5"   # 测试用1%数据，全量换成全量文件
+
+    # ---- 构建 P 矩阵 ----
+    P, L_spec = build_P_66xL(dtype=dtype, device="cpu")
+
+    # ---- 加载数据集 ----
     with h5py.File(dataset_h5, "r") as f:
         dataset = StellarDataset(
             x=torch.from_numpy(f["x"][:]),
@@ -533,8 +643,7 @@ if __name__ == "__main__":
             dtype=dtype,
         )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    # ---- 模型 ----
     model = StellarModel(
         P_66xL=P,
         latent_dim=latent_dim,
@@ -542,86 +651,51 @@ if __name__ == "__main__":
         dtype=dtype,
     ).to(device)
 
+    # 可选编译（PyTorch 2.0+）
+    try:
+        model = torch.compile(model, mode="reduce-overhead")
+    except Exception:
+        pass
+
+    # ---- 恒星参数 ----
     star = init_star_params(dataset, device, latent_dim=latent_dim)
 
-    train_stage(
-        model=model,
-        dataset=dataset,
-        L_spec=L_spec,
-        device=device,
-        epochs=512,
-        batch_size=1024,
-        lr=2e-4,
-        num_workers=4,  # === CHANGED ===
-        free_keys=(),
-        update_model=True,
-        train_k1=False,
-        star_params=star,
-        lambda_latent=1.0,
-        desc="Stage 1",
-    )
+    # ---- 四个训练阶段 ----
+    train_stage(model=model, dataset=dataset, L_spec=L_spec, device=device,
+                epochs=512, batch_size=1024, lr=1e-3, num_workers=4,
+                free_keys=(), update_model=True, train_k1=False,
+                star_params=star, lambda_latent=1.0, desc="Stage 1")
 
-    train_stage(
-        model=model,
-        dataset=dataset,
-        L_spec=L_spec,
-        device=device,
-        epochs=256,
-        batch_size=1024,
-        lr=2e-4,
-        num_workers=4,  # === CHANGED ===
-        free_keys=("latent",),
-        update_model=False,
-        train_k1=False,
-        star_params=star,
-        lambda_latent=1.0,
-        desc="Stage 2",
-    )
+    train_stage(model=model, dataset=dataset, L_spec=L_spec, device=device,
+                epochs=512, batch_size=1024, lr=1e-3, num_workers=4,
+                free_keys=("latent",), update_model=False, train_k1=False,
+                star_params=star, lambda_latent=1.0, desc="Stage 2")
 
-    train_stage(
-        model=model,
-        dataset=dataset,
-        L_spec=L_spec,
-        device=device,
-        epochs=512,
-        batch_size=1024,
-        lr=1e-4,
-        num_workers=4,  # === CHANGED ===
-        free_keys=("latent",),
-        update_model=True,
-        train_k1=False,
-        star_params=star,
-        lambda_latent=1.0,
-        desc="Stage 3",
-    )
+    train_stage(model=model, dataset=dataset, L_spec=L_spec, device=device,
+                epochs=512, batch_size=1024, lr=5e-4, num_workers=4,
+                free_keys=("latent",), update_model=True, train_k1=False,
+                star_params=star, lambda_latent=1.0, desc="Stage 3")
 
-    train_stage(
-        model=model,
-        dataset=dataset,
-        L_spec=L_spec,
-        device=device,
-        epochs=256,
-        batch_size=1024,
-        lr=1e-4,
-        num_workers=4,  # === CHANGED ===
-        free_keys=("x", "E", "plx", "latent"),
-        update_model=True,
-        train_k1=False,
-        star_params=star,
-        lambda_x=1.0,
-        lambda_E=1.0,
-        lambda_plx=1.0,
-        lambda_latent=1.0,
-        desc="Stage 4",
-    )
+    train_stage(model=model, dataset=dataset, L_spec=L_spec, device=device,
+                epochs=512, batch_size=1024, lr=5e-4, num_workers=4,
+                free_keys=("x", "E", "plx", "latent"), update_model=True,
+                train_k1=False, star_params=star,
+                lambda_x=1.0, lambda_E=1.0, lambda_plx=1.0, lambda_latent=1.0,
+                desc="Stage 4")
 
-    def save_model(path, model, star_params):
+    # ---- 只在 rank 0 保存 ----
+    if local_rank == 0:
         torch.save({
             "model_state": model.state_dict(),
-            "star_params": {
-                k: v.detach().cpu()
-                for k, v in star_params.items()
-            },
-        }, path)
+            "star_params": {k: v.detach().cpu() for k, v in star.items()},
+        }, "stellar_model.pt")
+        print("Training finished and model saved.")        
 
-    save_model("stellar_model.pt", model, star)
+
+def get_raw_model(model):
+    if hasattr(model, '_orig_mod'):
+        return model._orig_mod
+    return model
+
+# 使用：
+# model = get_raw_model(model)
