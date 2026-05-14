@@ -55,64 +55,39 @@ dtype = torch.float32
 
 # Build dataset
 class StellarDataset(Dataset):
-    def __init__(
-        self,
-        x: torch.Tensor,
-        E: torch.Tensor,
-        xi: torch.Tensor,
-        plx: torch.Tensor,
-        x_err: torch.Tensor,
-        E_err: torch.Tensor,
-        xi_err: torch.Tensor,
-        plx_err: torch.Tensor,
-        flux: torch.Tensor,
-        flux_sqrticov: torch.Tensor,
-        latent: Optional[torch.Tensor] = None,
-        latent_dim: int = 3,
-        dtype: torch.dtype = torch.float32,
-    ):
+    def __init__(self, mmap_path, latent_dim=3, dtype=torch.float32):
         super().__init__()
+        self.dtype = dtype
+        self.latent_dim = latent_dim
 
-        self.x = x.to(dtype)
-        self.E = E.to(dtype).view(-1)
-        self.xi = xi.to(dtype).view(-1)
-        self.plx = plx.to(dtype).view(-1)
+        # 使用 mmap 加载，多个进程共享物理内存
+        self.data = torch.load(mmap_path, map_location='cpu', mmap=True, weights_only=True)
+        self.length = self.data['x'].shape[0]
 
-        self.x_err = x_err.to(dtype)
-        self.E_err = E_err.to(dtype).view(-1)
-        self.xi_err = xi_err.to(dtype).view(-1)
-        self.plx_err = plx_err.to(dtype).view(-1)
-
-        self.flux = flux.to(dtype)
-        self.flux_sqrticov = flux_sqrticov.to(dtype)
-
-        n = self.x.shape[0]
-        self.latent = torch.zeros(n, latent_dim, dtype=dtype) if latent is None else latent.to(dtype)
-
-        assert self.E.numel() == n and self.xi.numel() == n and self.plx.numel() == n
-        assert self.latent.shape == (n, latent_dim)
-        assert self.flux.shape == (n, 66)
-        assert self.flux_sqrticov.shape == (n, 66, 66)
+        # 将所有张量转为统一 dtype，并暴露为属性
+        for key in list(self.data.keys()):
+            tensor = self.data[key].to(dtype=dtype)
+            self.data[key] = tensor
+            setattr(self, key, tensor)          # 兼容 dataset.x / dataset.E 等访问
 
     def __len__(self):
-        return self.x.shape[0]
+        return self.length
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx):
         return {
             "idx": torch.tensor(idx, dtype=torch.long),
-            "x": self.x[idx],
-            "E": self.E[idx],
-            "xi": self.xi[idx],
-            "plx": self.plx[idx],
-            "x_err": self.x_err[idx],
-            "E_err": self.E_err[idx],
-            "xi_err": self.xi_err[idx],
-            "plx_err": self.plx_err[idx],
-            "latent": self.latent[idx],
-            "flux": self.flux[idx],
-            "flux_sqrticov": self.flux_sqrticov[idx],
+            "x": self.data['x'][idx],
+            "E": self.data['E'][idx],
+            "xi": self.data['xi'][idx],
+            "plx": self.data['plx'][idx],
+            "x_err": self.data['x_err'][idx],
+            "E_err": self.data['E_err'][idx],
+            "xi_err": self.data['xi_err'][idx],
+            "plx_err": self.data['plx_err'][idx],
+            "flux": self.data['flux'][idx],
+            "flux_sqrticov": self.data['flux_sqrticov'][idx],
+            "latent": self.data['latent'][idx],
         }
-
 
 # -------------------------
 # 2) Fixed projection matrix P (build once)
@@ -348,9 +323,9 @@ def init_star_params(dataset: Dataset, device: str, latent_dim: int = 3):
 
     star = {
         "x_pred": nn.Parameter(x0.clone()),
-        "log_E_pred": nn.Parameter(torch.log(E0)),             # 初始化为 logE
+        "log_E_pred": nn.Parameter(torch.log(E0.clamp_min(1e-6))),             # 初始化为 logE
         "xi_pred": nn.Parameter(xi0.clone()),
-        "log_plx_pred": nn.Parameter(torch.log(plx0)),
+        "log_plx_pred": nn.Parameter(torch.log(plx0.clamp_min(1e-6))),
         "latent_pred": nn.Parameter(1e-2 * torch.randn(N, latent_dim, device=device, dtype=dtype)),
     }
 
@@ -562,20 +537,18 @@ def train_stage(
                 ).pow(2).sum(dim=1).mean()
             if "E" in free_keys:
                 E_err = batch["E_err"].view(-1).clamp_min(1e-6)
-                # 将 logE 转回线性 E
                 E_pred_lin = torch.exp(star_params["log_E_pred"][idx].view(-1))
-                prior_loss = prior_loss + lambda_E * (
-                    (E_pred_lin - E0[idx]) / E_err
-                    -2*star_params["log_E_pred"][idx].view(-1)
-                ).pow(2).mean() 
+                gaussian_prior = lambda_E * ((E_pred_lin - E0[idx]) / E_err).pow(2).mean()
+                jacobian = -2.0 * lambda_E * star_params["log_E_pred"][idx].view(-1).mean()   # 取均值
+                prior_loss = prior_loss + gaussian_prior + jacobian
+            
             if "plx" in free_keys:
                 log_plx_pred = star_params["log_plx_pred"][idx].view(-1)
                 plx_err = batch["plx_err"].view(-1).clamp_min(1e-6)
                 sig_log_plx = (plx_err / plx0[idx]).clamp_min(1e-6)
-                prior_loss = prior_loss + lambda_plx * (
-                    (log_plx_pred - torch.log(plx0[idx])) / sig_log_plx
-                    -2*log_plx_pred
-                ).pow(2).mean()
+                gaussian_prior = lambda_plx * ((log_plx_pred - torch.log(plx0[idx])) / sig_log_plx).pow(2).mean()
+                jacobian = -2.0 * lambda_plx * log_plx_pred.mean()
+                prior_loss = prior_loss + gaussian_prior + jacobian
 
             loss = loss + prior_loss
 
