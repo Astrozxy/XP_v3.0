@@ -20,6 +20,7 @@ from astropy.table import Table
 import matplotlib.pyplot as plt
 
 import torch.distributed as dist
+from torch.func import jacrev
 
 def is_distributed():
     return dist.is_available() and dist.is_initialized()
@@ -277,8 +278,8 @@ def compute_loss(
     L_spec: int,
     lambda_xi: float = 1.0,
     lambda_latent: float = 1.0,
-    lambda_smooth: float = 1e-3,          # 现在只用于光谱平滑
-    lambda_smooth_ext: float = 1e-3,      # 新增：消光曲线平滑
+    lambda_smooth: float = 1e-3,         
+    lambda_smooth_ext: float = 1e-3,      
 ) -> torch.Tensor:
     d_flux = (batch["flux"] - out["flux_pred"]).unsqueeze(-1)
     Wr = batch["flux_sqrticov"] @ d_flux
@@ -289,12 +290,10 @@ def compute_loss(
 
     chi2_latent = out["latent"].pow(2).sum(dim=1)
 
-    # 光谱平滑：只对光学部分（前 L_spec 个点）
     log_F_pred = out["log_F_int"][:, :L_spec]
     d2 = log_F_pred[:, 2:] - 2 * log_F_pred[:, 1:-1] + log_F_pred[:, :-2]
     smooth_flux = d2.pow(2).mean(dim=1)
 
-    # 消光曲线平滑：也只对光学部分
     k0 = out["ext_k0"][:L_spec]
     k1 = out["ext_k1"][:L_spec]
     d2_k0 = k0[2:] - 2 * k0[1:-1] + k0[:-2]
@@ -305,8 +304,8 @@ def compute_loss(
         chi2_flux
         + lambda_xi * chi2_xi
         + lambda_latent * chi2_latent 
-        + lambda_smooth * smooth_flux          # 分开加权
-        + lambda_smooth_ext * smooth_ext       # 分开加权
+        + lambda_smooth * smooth_flux          
+        + lambda_smooth_ext * smooth_ext     
     )
 
     return loss.mean()
@@ -507,25 +506,18 @@ def train_stage(
 
             # ---- 潜变量梯度惩罚 ----
             if update_model and lambda_latent_grad != 0:
-                x_det = batch_fwd.get("x_pred", batch_fwd["x"]).detach()
-                plx_det = batch_fwd.get(
-                    "log_plx_pred",
-                    torch.log(batch_fwd["plx"].clamp_min(1e-6))
-                ).detach()
-
-                def sum_spec_fn(lat_1, x_1, plx_1):
-                    log_F_int = base_model.spectrum_model(
-                        torch.cat([x_1, lat_1]).unsqueeze(0)
-                    )
-                    log_F_int = log_F_int + 2 * plx_1.unsqueeze(0)
-                    return log_F_int[0, :L_spec].sum()
-
-                grad_latent = vmap(grad(sum_spec_fn), in_dims=(0, 0, 0))(
-                    out["latent"],
-                    x_det,
-                    plx_det,
-                )
-                latent_grad_loss = grad_latent.pow(2).sum(dim=1).mean()
+                x_det = batch_fwd.get("x_pred", batch_fwd["x"]).detach()   # (B, x_dim)
+            
+                def spec_fn(lat, x):
+                    # lat: (latent_dim,), x: (x_dim,)
+                    return base_model.spectrum_model(
+                        torch.cat([x, lat], dim=-1).unsqueeze(0)
+                    )[0, :L_spec]  # 输出光学部分光谱 (L_spec,)
+            
+                # jacrev 计算 spec_fn 关于第一个参数(lat)的雅可比，vmap 同时对 batch 的 lat 和 x 操作
+                jacobian = vmap(jacrev(spec_fn), in_dims=(0, 0))(out["latent"], x_det)
+                # jacobian: (B, L_spec, latent_dim)
+                latent_grad_loss = jacobian.pow(2).sum(dim=(1, 2)).mean()
                 loss = loss + lambda_latent_grad * latent_grad_loss
 
             # ---- 先验惩罚 ----
@@ -539,7 +531,7 @@ def train_stage(
                 E_err = batch["E_err"].view(-1).clamp_min(1e-6)
                 E_pred_lin = torch.exp(star_params["log_E_pred"][idx].view(-1))
                 gaussian_prior = lambda_E * ((E_pred_lin - E0[idx]) / E_err).pow(2).mean()
-                jacobian = -2.0 * lambda_E * star_params["log_E_pred"][idx].view(-1).mean()   # 取均值
+                jacobian = -2.0 * lambda_E * star_params["log_E_pred"][idx].view(-1).mean()
                 prior_loss = prior_loss + gaussian_prior + jacobian
             
             if "plx" in free_keys:

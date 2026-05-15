@@ -128,7 +128,6 @@ def train_stage_from_config(
 
 
 def convert_h5_to_mmap(h5_path, pt_path, rank=0):
-    """只在 rank 0 执行转换，其他 rank 等待。"""
     if rank == 0:
         print(f"Converting {h5_path} -> {pt_path} (one-time operation)...")
         with h5py.File(h5_path, "r") as f:
@@ -146,8 +145,7 @@ def convert_h5_to_mmap(h5_path, pt_path, rank=0):
                 "latent": torch.from_numpy(f["latent"][:]),
             }
         torch.save(data, pt_path, _use_new_zipfile_serialization=True)
-        print(f"✅ Converted to {pt_path}")
-    # 分布式时需同步，确保所有 rank 在转换完成后才读取文件
+        print(f" Converted to {pt_path}")
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
